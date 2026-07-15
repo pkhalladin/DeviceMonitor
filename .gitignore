@@ -1,0 +1,9 @@
+# .NET / Visual Studio
+bin/
+obj/
+.vs/
+*.user
+
+# Third-party installer (PawnIO ring0 driver, needed by LibreHardwareMonitor for CPU temp) —
+# not redistributed here; download from https://pawnio.eu/
+PawnIO_setup.exe

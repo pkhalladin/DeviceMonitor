@@ -1,0 +1,98 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="DeviceMonitor.BleClient.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Title="DeviceMonitor">
+
+    <!-- Black background so the readout matches the device screen. The connection status
+         is shown in the custom title bar (see OnStatusMessage), not in the body. -->
+    <Grid Background="Black">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="32" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- Custom title bar: drag region + status text; the system draws the caption
+             buttons on top of it (ExtendsContentIntoTitleBar in the constructor). -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Background="Transparent">
+            <!-- Right margin keeps the text clear of the caption buttons (3 × 46 px). -->
+            <TextBlock x:Name="TitleText"
+                       Text="DeviceMonitor"
+                       Margin="16,0,140,0"
+                       VerticalAlignment="Center"
+                       Foreground="#C8C8C8"
+                       FontSize="12"
+                       TextTrimming="CharacterEllipsis" />
+        </Grid>
+
+        <!-- Left click anywhere in the body cycles the views (table / CPU chart / GPU chart),
+             like the BOOT button on the device. Transparent background keeps the whole
+             area hit-testable. -->
+        <Grid x:Name="Body" Grid.Row="1" Padding="24" Background="Transparent"
+              PointerPressed="OnBodyPointerPressed">
+            <Grid.Resources>
+                <!-- Bundled pixel/monospace font (VT323) matching the device LCD glcdfont. -->
+                <Style TargetType="TextBlock">
+                    <Setter Property="FontFamily" Value="ms-appx:///Assets/Fonts/VT323-Regular.ttf#VT323" />
+                    <Setter Property="FontSize" Value="18" />
+                </Style>
+            </Grid.Resources>
+
+            <!-- View 0: metrics readout (mirrors the device screen) -->
+            <Grid x:Name="TableView"
+                  VerticalAlignment="Center"
+                  HorizontalAlignment="Center"
+                  ColumnSpacing="28"
+                  RowSpacing="12">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="90" />
+                    <ColumnDefinition Width="90" />
+                    <ColumnDefinition Width="90" />
+                </Grid.ColumnDefinitions>
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+
+                <!-- Column headers carry the units (muted gray); cells show the bare number -->
+                <TextBlock Grid.Row="0" Grid.Column="1" Text="LOAD%" Foreground="#808080" HorizontalAlignment="Right" />
+                <TextBlock Grid.Row="0" Grid.Column="2" Text="TEMP°C" Foreground="#808080" HorizontalAlignment="Right" />
+                <TextBlock Grid.Row="0" Grid.Column="3" Text="MEM%"  Foreground="#808080" HorizontalAlignment="Right" />
+
+                <!-- CPU row (per-column colors: LOAD white, TEMP yellow, MEM violet) -->
+                <TextBlock Grid.Row="1" Grid.Column="0" Text="CPU" Foreground="#808080" VerticalAlignment="Center" />
+                <TextBlock x:Name="CpuLoad" Grid.Row="1" Grid.Column="1" Text="--" Foreground="#808080" FontSize="36" HorizontalAlignment="Right" />
+                <TextBlock x:Name="CpuTemp" Grid.Row="1" Grid.Column="2" Text="--" Foreground="#808080" FontSize="36" HorizontalAlignment="Right" />
+                <TextBlock x:Name="CpuMem"  Grid.Row="1" Grid.Column="3" Text="--" Foreground="#808080" FontSize="36" HorizontalAlignment="Right" />
+
+                <!-- GPU row -->
+                <TextBlock Grid.Row="2" Grid.Column="0" Text="GPU" Foreground="#808080" VerticalAlignment="Center" />
+                <TextBlock x:Name="GpuLoad" Grid.Row="2" Grid.Column="1" Text="--" Foreground="#808080" FontSize="36" HorizontalAlignment="Right" />
+                <TextBlock x:Name="GpuTemp" Grid.Row="2" Grid.Column="2" Text="--" Foreground="#808080" FontSize="36" HorizontalAlignment="Right" />
+                <TextBlock x:Name="GpuMem"  Grid.Row="2" Grid.Column="3" Text="--" Foreground="#808080" FontSize="36" HorizontalAlignment="Right" />
+            </Grid>
+
+            <!-- Views 1/2: CPU / GPU line charts (mirror the device chart views). Title and
+                 legend are static chrome; axes, labels and lines are drawn on PlotCanvas. -->
+            <Grid x:Name="ChartView" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+
+                <StackPanel Orientation="Horizontal" Spacing="14">
+                    <TextBlock x:Name="ChartTitle" Text="CPU" Foreground="#808080" FontSize="22" />
+                    <TextBlock Text="LOAD" Foreground="#FEFEFE" FontSize="14" VerticalAlignment="Center" />
+                    <TextBlock Text="TEMP" Foreground="#FFFF00" FontSize="14" VerticalAlignment="Center" />
+                    <TextBlock Text="MEM"  Foreground="#C500E6" FontSize="14" VerticalAlignment="Center" />
+                </StackPanel>
+
+                <Canvas x:Name="PlotCanvas" Grid.Row="1" Margin="0,8,0,0"
+                        SizeChanged="OnPlotSizeChanged" />
+            </Grid>
+        </Grid>
+    </Grid>
+</Window>
