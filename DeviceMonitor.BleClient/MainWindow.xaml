@@ -6,7 +6,7 @@
     Title="DeviceMonitor">
 
     <!-- Black background so the readout matches the device screen. The connection status
-         is shown in the custom title bar (see OnStatusMessage), not in the body. -->
+         is shown in the custom title bar (see ApplyTitleStatus), not in the body. -->
     <Grid Background="Black">
         <Grid.RowDefinitions>
             <RowDefinition Height="32" />

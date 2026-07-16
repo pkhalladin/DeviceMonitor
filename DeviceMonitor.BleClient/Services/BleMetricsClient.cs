@@ -10,6 +10,12 @@ using Windows.Storage.Streams;
 
 namespace DeviceMonitor.BleClient.Services;
 
+/// <summary>Connection lifecycle states reported via <see cref="BleMetricsClient.StatusChanged"/>.</summary>
+public enum BleStatusKind { Idle, Scanning, Connecting, Discovering, Connected, Disconnected, Error }
+
+/// <summary>Status update; <paramref name="Detail"/> carries diagnostics (used for errors).</summary>
+public readonly record struct BleStatus(BleStatusKind Kind, string? Detail = null);
+
 /// <summary>
 /// BLE central. Scans for the "DeviceMonitor" peripheral, connects, and once per second
 /// writes the current 6-byte metrics frame (supplied by a payload provider) to the metrics
@@ -33,7 +39,7 @@ public sealed class BleMetricsClient
     private bool _connecting;
     private bool _connected;
 
-    public event EventHandler<string>? StatusChanged;
+    public event EventHandler<BleStatus>? StatusChanged;
 
     /// <summary>Raised with true right after connecting, false when the link tears down.</summary>
     public event EventHandler<bool>? ConnectedChanged;
@@ -64,13 +70,13 @@ public sealed class BleMetricsClient
         StopTimer();
         StopWatcher();
         Cleanup();
-        SetStatus("Idle");
+        SetStatus(BleStatusKind.Idle);
     }
 
     // ---- Scanning ----------------------------------------------------------
     private void StartScan()
     {
-        SetStatus("Scanning…");
+        SetStatus(BleStatusKind.Scanning);
         _watcher = new BluetoothLEAdvertisementWatcher
         {
             ScanningMode = BluetoothLEScanningMode.Active,
@@ -130,14 +136,14 @@ public sealed class BleMetricsClient
     // ---- Connecting --------------------------------------------------------
     private async Task ConnectAsync(ulong address)
     {
-        SetStatus("Connecting…");
+        SetStatus(BleStatusKind.Connecting);
         try
         {
             _device = await BluetoothLEDevice.FromBluetoothAddressAsync(address);
             if (_device is null)
             {
                 // Not in the system cache yet — keep scanning for the next packet.
-                SetStatus("Not cached, rescanning…");
+                SetStatus(BleStatusKind.Scanning);
                 await Task.Delay(500);
                 if (_running)
                 {
@@ -189,14 +195,14 @@ public sealed class BleMetricsClient
 
                 if (service is null)
                 {
-                    SetStatus($"Discovering service… ({lastError}, try {attempt}/6)");
+                    SetStatus(BleStatusKind.Discovering, $"service: {lastError}, try {attempt}/6");
                     await Task.Delay(700);
                 }
             }
 
             if (service is null)
             {
-                SetStatus($"Service not found ({lastError})");
+                SetStatus(BleStatusKind.Error, $"Service not found ({lastError})");
                 await Task.Delay(1500);
                 RestartScan();
                 return;
@@ -241,14 +247,14 @@ public sealed class BleMetricsClient
 
                 if (metrics is null)
                 {
-                    SetStatus($"Discovering characteristic… ({charError}, try {attempt}/6)");
+                    SetStatus(BleStatusKind.Discovering, $"characteristic: {charError}, try {attempt}/6");
                     await Task.Delay(700);
                 }
             }
 
             if (metrics is null)
             {
-                SetStatus($"Characteristic not found ({charError})");
+                SetStatus(BleStatusKind.Error, $"Characteristic not found ({charError})");
                 await Task.Delay(1500);
                 RestartScan();
                 return;
@@ -260,14 +266,14 @@ public sealed class BleMetricsClient
             _session = await GattSession.FromDeviceIdAsync(_device.BluetoothDeviceId);
             _session.MaintainConnection = true;
 
-            SetStatus("Connected");
+            SetStatus(BleStatusKind.Connected);
             _connected = true;
             ConnectedChanged?.Invoke(this, true);
             StartTimer();
         }
         catch (Exception ex)
         {
-            SetStatus($"Error 0x{ex.HResult:X8}: {ex.Message}");
+            SetStatus(BleStatusKind.Error, $"0x{ex.HResult:X8}: {ex.Message}");
             await Task.Delay(1500);
             RestartScan();
         }
@@ -292,7 +298,7 @@ public sealed class BleMetricsClient
                 return;
             }
 
-            SetStatus("Disconnected");
+            SetStatus(BleStatusKind.Disconnected);
             RestartScan();
         });
     }
@@ -349,7 +355,7 @@ public sealed class BleMetricsClient
 
             if (result.Status != GattCommunicationStatus.Success)
             {
-                SetStatus($"Write failed: {result.Status}");
+                SetStatus(BleStatusKind.Error, $"Write failed: {result.Status}");
             }
             else
             {
@@ -360,7 +366,7 @@ public sealed class BleMetricsClient
         }
         catch (Exception ex)
         {
-            SetStatus($"Write error: {ex.Message}");
+            SetStatus(BleStatusKind.Error, $"Write error: {ex.Message}");
         }
         finally
         {
@@ -399,5 +405,6 @@ public sealed class BleMetricsClient
         }
     }
 
-    private void SetStatus(string status) => StatusChanged?.Invoke(this, status);
+    private void SetStatus(BleStatusKind kind, string? detail = null) =>
+        StatusChanged?.Invoke(this, new BleStatus(kind, detail));
 }

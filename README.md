@@ -98,7 +98,8 @@ and **Exit**.
 > for convenience but is built/flashed through PlatformIO, not Visual Studio.
 
 ## Test end-to-end
-Power the board, launch the client → status becomes `Connected` and the LCD table shows the
+Power the board, launch the client → the title status emoji settles on 🟢 (connected; 🔍/⏳
+animate while scanning/connecting) and the LCD table shows the
 same CPU/GPU numbers as the app window, updated every second. Sensors without a reading
 (e.g. no dedicated GPU) show `--`. If the board is off/out of range the client keeps
 scanning and reconnects when it reappears.

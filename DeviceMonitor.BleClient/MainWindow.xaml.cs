@@ -35,6 +35,12 @@ public sealed partial class MainWindow : Window
     private bool _trayCreated;
     private bool _exiting;
 
+    // ---- Title status (emoji in the window/taskbar title; see ApplyTitleStatus) ----
+    private BleStatusKind _titleKind = BleStatusKind.Idle;
+    private string? _titleDetail;
+    private bool _titleFrame;                 // alternates the two-frame title animations
+    private DispatcherQueueTimer? _titleTimer;
+
     // ---- Chart views (mirror the device: view 0 = table, 1 = CPU chart, 2 = GPU chart) ----
     private const int HistLen = 100;   // rolling history depth: 100 samples = ~100 s (1 sample/s)
     private const byte Na = 0xFF;      // sentinel for "no reading"
@@ -63,10 +69,10 @@ public sealed partial class MainWindow : Window
 
         _hardware = new HardwareMonitorService();
         _hardware.Updated += OnSample;
-        _hardware.Error += OnStatusMessage;
+        _hardware.Error += OnErrorMessage;
 
         _client = new BleMetricsClient(_dispatcher, () => _hardware.CurrentPayload);
-        _client.StatusChanged += OnStatusMessage;
+        _client.StatusChanged += OnBleStatus;
         _client.ConnectedChanged += OnConnectedChanged;
         _client.FrameSent += OnFrameSent;
 
@@ -248,7 +254,7 @@ public sealed partial class MainWindow : Window
         }
         catch (Exception ex)
         {
-            OnStatusMessage(this, $"Autostart failed: {ex.Message}");
+            OnErrorMessage(this, $"Autostart failed: {ex.Message}");
         }
     }
 
@@ -289,6 +295,7 @@ public sealed partial class MainWindow : Window
     private void ExitApp()
     {
         _exiting = true;
+        _titleTimer?.Stop();
         _tray?.Dispose();
         _tray = null;
         _client.Stop();
@@ -301,6 +308,7 @@ public sealed partial class MainWindow : Window
         // Backstop cleanup (idempotent). Stopping the services below still raises their
         // events, so mark the window as gone before any callback can touch it.
         _exiting = true;
+        _titleTimer?.Stop();
         _tray?.Dispose();
         _tray = null;
         _client.Stop();
@@ -526,9 +534,16 @@ public sealed partial class MainWindow : Window
         EndSegment();
     }
 
-    // Connection status lives in the title bar, not the body. Title covers the
-    // taskbar/Alt-Tab label; TitleText is the visible custom title bar.
-    private void OnStatusMessage(object? sender, string message) =>
+    // Connection status lives in the title bar, not the body, as an emoji prefix. Title
+    // covers the taskbar/Alt-Tab label; TitleText is the visible custom title bar.
+    private void OnBleStatus(object? sender, BleStatus status) =>
+        ApplyTitleStatus(status.Kind, status.Detail);
+
+    // Hardware/autostart errors share the title's error surface.
+    private void OnErrorMessage(object? sender, string message) =>
+        ApplyTitleStatus(BleStatusKind.Error, message);
+
+    private void ApplyTitleStatus(BleStatusKind kind, string? detail) =>
         _dispatcher.TryEnqueue(() =>
         {
             if (_exiting)
@@ -536,10 +551,65 @@ public sealed partial class MainWindow : Window
                 return; // the window may already be closed — touching it throws
             }
 
-            var text = $"DeviceMonitor — {message}";
-            Title = text;
-            TitleText.Text = text;
+            _titleKind = kind;
+            _titleDetail = detail;
+
+            // Waiting states animate (two frames flipped by the timer); the rest are static.
+            bool animated = kind is BleStatusKind.Scanning
+                or BleStatusKind.Connecting
+                or BleStatusKind.Discovering;
+            if (animated)
+            {
+                _titleTimer ??= CreateTitleTimer();
+                if (!_titleTimer.IsRunning)
+                {
+                    _titleTimer.Start();
+                }
+            }
+            else
+            {
+                _titleTimer?.Stop();
+            }
+
+            RenderTitle();
         });
+
+    private DispatcherQueueTimer CreateTitleTimer()
+    {
+        var timer = _dispatcher.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(600);
+        timer.Tick += (_, _) =>
+        {
+            if (_exiting)
+            {
+                return;
+            }
+
+            _titleFrame = !_titleFrame;
+            RenderTitle();
+        };
+        return timer;
+    }
+
+    private void RenderTitle()
+    {
+        string emoji = _titleKind switch
+        {
+            BleStatusKind.Scanning => _titleFrame ? "🔎" : "🔍",
+            BleStatusKind.Connecting or BleStatusKind.Discovering => _titleFrame ? "⌛" : "⏳",
+            BleStatusKind.Connected => "🟢",
+            BleStatusKind.Disconnected => "🔴",
+            BleStatusKind.Error => "⚠️",
+            _ => "💤", // Idle
+        };
+
+        // Errors are the one state that keeps its diagnostic text next to the emoji.
+        string text = _titleKind == BleStatusKind.Error && !string.IsNullOrEmpty(_titleDetail)
+            ? $"{emoji} DeviceMonitor — {_titleDetail}"
+            : $"{emoji} DeviceMonitor";
+        Title = text;
+        TitleText.Text = text;
+    }
 
     private static void SetCell(TextBlock cell, string text, SolidColorBrush color)
     {
