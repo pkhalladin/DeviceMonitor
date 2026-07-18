@@ -26,7 +26,7 @@ public sealed partial class MainWindow : Window
 
     // Per-column value colors (match the device screen); gray is used for "--" (no reading).
     private static readonly SolidColorBrush LoadBrush = new(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF)); // white
-    private static readonly SolidColorBrush TempBrush = new(Color.FromArgb(0xFF, 0xFF, 0xFF, 0x00)); // yellow
+    private static readonly SolidColorBrush TempBrush = new(Color.FromArgb(0xFF, 0xFF, 0xC1, 0x07)); // amber (yellow on the device — pulled toward orange here to stand apart from white)
     private static readonly SolidColorBrush MemBrush  = new(Color.FromArgb(0xFF, 0xD9, 0x66, 0xFF)); // violet (brighter than the device's — the dark hue is too dim on a desktop screen)
     private static readonly SolidColorBrush NaBrush   = new(Color.FromArgb(0xFF, 0x80, 0x80, 0x80)); // gray
 
@@ -44,18 +44,20 @@ public sealed partial class MainWindow : Window
     private readonly SD.Icon?[] _trayIcons = new SD.Icon?[2];
     private readonly nint[] _trayHicons = new nint[2];
 
-    // Both icons show one metric at a time (0 load, 1 temp, 2 mem) as a big number,
-    // advanced in lockstep by _trayTimer (same metric, same color on both at any
-    // moment); a metric with no reading on either device is skipped so it does not
-    // waste a slot in the cycle.
-    private int _trayMetric;
+    // Each icon shows one metric (0 load, 1 temp, 2 mem) as a big number. Every
+    // _trayTimer tick each device independently switches to the metric that moved
+    // the most since the previous tick (largest |current - previous|); ties keep
+    // the incumbent so a quiet system does not flicker between colors.
+    private readonly int[] _trayMetrics = new int[2];
+    // Values as of the previous tick — the comparison base for the deltas.
+    private readonly byte[] _trayPrevValues = { Na, Na, Na, Na, Na, Na };
     private DispatcherQueueTimer? _trayTimer;
 
     // Metric palette as System.Drawing colors (same values as the brushes above).
     private static readonly SD.Color[] TrayMetricColors =
     {
         SD.Color.FromArgb(0xFF, 0xFF, 0xFF), // load
-        SD.Color.FromArgb(0xFF, 0xFF, 0x00), // temp
+        SD.Color.FromArgb(0xFF, 0xC1, 0x07), // temp
         SD.Color.FromArgb(0xD9, 0x66, 0xFF), // mem
     };
     private static readonly SD.Color TrayNaColor = SD.Color.FromArgb(0x80, 0x80, 0x80);
@@ -244,7 +246,7 @@ public sealed partial class MainWindow : Window
             }
 
             var (icon, hicon) = CreateValueIcon(
-                _trayValues[i * 3 + _trayMetric], TrayMetricColors[_trayMetric]);
+                _trayValues[i * 3 + _trayMetrics[i]], TrayMetricColors[_trayMetrics[i]]);
             tray.Icon = icon;
             DestroyTrayIconImage(i);
             _trayIcons[i] = icon;
@@ -252,9 +254,9 @@ public sealed partial class MainWindow : Window
         }
     }
 
-    // Advances the shared cycle to the next metric and redraws both icons. A slot is
-    // skipped only when the metric has no reading on either device — a sensor missing
-    // on just one of them shows as "--" there, keeping the two icons in lockstep.
+    // Each tick re-picks, per device, the metric with the largest change since the
+    // previous tick and redraws both icons with the values as of the tick (frozen
+    // for the whole second).
     private DispatcherQueueTimer CreateTrayTimer()
     {
         var timer = _dispatcher.CreateTimer();
@@ -266,19 +268,42 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
-            for (var step = 1; step <= 3; step++)
+            for (var i = 0; i < 2; i++)
             {
-                var next = (_trayMetric + step) % 3;
-                if (_trayValues[next] != Na || _trayValues[3 + next] != Na)
+                // Start from the incumbent so a tie does not switch the metric.
+                var bestMetric = _trayMetrics[i];
+                var bestDelta = TrayDelta(i, bestMetric);
+                for (var m = 0; m < 3; m++)
                 {
-                    _trayMetric = next;
-                    break;
+                    var delta = TrayDelta(i, m);
+                    if (delta > bestDelta)
+                    {
+                        bestDelta = delta;
+                        bestMetric = m;
+                    }
                 }
+
+                _trayMetrics[i] = bestMetric;
             }
 
+            _trayValues.CopyTo(_trayPrevValues, 0);
             UpdateTrayIcons();
         };
         return timer;
+    }
+
+    // Change of a metric since the previous tick: -1 = no current reading (never
+    // selected), 255 = a reading just (re)appeared, otherwise |current - previous|.
+    private int TrayDelta(int device, int metric)
+    {
+        var cur = _trayValues[device * 3 + metric];
+        var prev = _trayPrevValues[device * 3 + metric];
+        if (cur == Na)
+        {
+            return -1;
+        }
+
+        return prev == Na ? 255 : Math.Abs(cur - prev);
     }
 
     private void DestroyTrayIconImage(int i)

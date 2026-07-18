@@ -86,7 +86,7 @@
                 <StackPanel Orientation="Horizontal" Spacing="14">
                     <TextBlock x:Name="ChartTitle" Text="CPU" Foreground="#808080" FontSize="22" />
                     <TextBlock Text="LOAD" Foreground="#FEFEFE" FontSize="14" VerticalAlignment="Center" />
-                    <TextBlock Text="TEMP" Foreground="#FFFF00" FontSize="14" VerticalAlignment="Center" />
+                    <TextBlock Text="TEMP" Foreground="#FFC107" FontSize="14" VerticalAlignment="Center" />
                     <TextBlock Text="MEM"  Foreground="#D966FF" FontSize="14" VerticalAlignment="Center" />
                 </StackPanel>
 
