@@ -44,14 +44,41 @@ public sealed partial class MainWindow : Window
     private readonly SD.Icon?[] _trayIcons = new SD.Icon?[2];
     private readonly nint[] _trayHicons = new nint[2];
 
-    // Each icon shows one metric (0 load, 1 temp, 2 mem) as a big number. Every
-    // _trayTimer tick each device independently switches to the metric that moved
-    // the most since the previous tick (largest |current - previous|); ties keep
-    // the incumbent so a quiet system does not flicker between colors.
+    // Each icon shows one metric (0 load, 1 temp, 2 mem) as a big number. While
+    // the window is hidden the icon is frozen: it redraws only when some metric
+    // drifts at least TraySwitchMinDelta away from the value stored at the last
+    // redraw — then it switches to the metric that drifted the most (incumbent
+    // wins ties). While the window is visible the number runs LIVE with every
+    // sample (the same numbers the window shows); the drift rule keeps deciding
+    // which metric is on the icon.
     private readonly int[] _trayMetrics = new int[2];
-    // Values as of the previous tick — the comparison base for the deltas.
-    private readonly byte[] _trayPrevValues = { Na, Na, Na, Na, Na, Na };
+    // Minimum accumulated drift needed to redraw a hidden icon / re-pick its
+    // metric (keeps 1-2 point jitter from flipping the value or color).
+    private const int TraySwitchMinDelta = 3;
+    // Values as of the last (re)selection — the comparison base for the drifts.
+    private readonly byte[] _trayShownValues = { Na, Na, Na, Na, Na, Na };
+    // The value actually drawn on each icon (the last fade target) — the "from"
+    // of the next fade and the guard against redundant redraws.
+    private readonly byte[] _trayGlyphValues = { Na, Na };
     private DispatcherQueueTimer? _trayTimer;
+
+    // A redraw does not swap the icon instantly: the old glyph fades into the
+    // background, then the new one fades out of it (~300 ms each way; see
+    // BeginTrayFade). One shared 30 ms timer drives both icons and runs only
+    // while something is animating.
+    private sealed class TrayFade
+    {
+        public byte FromValue;
+        public SD.Color FromColor;
+        public byte ToValue;
+        public SD.Color ToColor;
+        public float Opacity = 1f; // of the glyph drawn right now
+        public bool FadingIn;      // false = the old glyph is still fading out
+    }
+
+    private readonly TrayFade?[] _trayFades = new TrayFade?[2];
+    private DispatcherQueueTimer? _trayFadeTimer;
+    private const float TrayFadeStep = 0.1f; // opacity per 30 ms frame → 10 frames a phase
 
     // Metric palette as System.Drawing colors (same values as the brushes above).
     private static readonly SD.Color[] TrayMetricColors =
@@ -228,35 +255,59 @@ public sealed partial class MainWindow : Window
         _trayTimer.Start();
     }
 
-    // Redraws both tray icons with the currently cycled metric and swaps them in.
-    // The previous Icon/HICON pair is released only after the swap (the shell keeps
-    // its own copy of the icon).
     private void UpdateTrayIcons()
     {
-        if (_exiting)
+        for (var i = 0; i < 2; i++)
+        {
+            UpdateTrayIcon(i);
+        }
+    }
+
+    private void UpdateTrayIcon(int i)
+    {
+        var value = _trayValues[i * 3 + _trayMetrics[i]];
+        _trayGlyphValues[i] = value;
+        RenderTrayIcon(i, value, TrayMetricColors[_trayMetrics[i]], 1f);
+    }
+
+    // Live-mode refresh (window visible): fades the icon to the raw reading of
+    // its current metric as soon as it changes.
+    private void RefreshTrayLive(int i)
+    {
+        var metric = _trayMetrics[i];
+        var target = _trayValues[i * 3 + metric];
+        if (target == _trayGlyphValues[i])
         {
             return;
         }
 
-        for (var i = 0; i < 2; i++)
-        {
-            if (_trays[i] is not { } tray)
-            {
-                continue;
-            }
-
-            var (icon, hicon) = CreateValueIcon(
-                _trayValues[i * 3 + _trayMetrics[i]], TrayMetricColors[_trayMetrics[i]]);
-            tray.Icon = icon;
-            DestroyTrayIconImage(i);
-            _trayIcons[i] = icon;
-            _trayHicons[i] = hicon;
-        }
+        BeginTrayFade(
+            i, _trayGlyphValues[i], TrayMetricColors[metric],
+            target, TrayMetricColors[metric]);
+        _trayGlyphValues[i] = target;
     }
 
-    // Each tick re-picks, per device, the metric with the largest change since the
-    // previous tick and redraws both icons with the values as of the tick (frozen
-    // for the whole second).
+    // Draws one tray icon frame and swaps it in. The previous Icon/HICON pair is
+    // released only after the swap (the shell keeps its own copy of the icon).
+    private void RenderTrayIcon(int i, byte value, SD.Color color, float opacity)
+    {
+        if (_exiting || _trays[i] is not { } tray)
+        {
+            return;
+        }
+
+        var (icon, hicon) = CreateValueIcon(value, color, opacity);
+        tray.Icon = icon;
+        DestroyTrayIconImage(i);
+        _trayIcons[i] = icon;
+        _trayHicons[i] = hicon;
+    }
+
+    // Each tick checks, per device, how far each metric has drifted from the
+    // value stored at the last redraw and re-picks the metric once the largest
+    // drift reaches TraySwitchMinDelta. Hidden, that is also the only thing that
+    // ever redraws an icon; visible, the number additionally runs live from
+    // OnSample between selections.
     private DispatcherQueueTimer CreateTrayTimer()
     {
         var timer = _dispatcher.CreateTimer();
@@ -268,11 +319,13 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            var live = AppWindow.IsVisible;
             for (var i = 0; i < 2; i++)
             {
                 // Start from the incumbent so a tie does not switch the metric.
+                var incumbentDelta = TrayDelta(i, _trayMetrics[i]);
                 var bestMetric = _trayMetrics[i];
-                var bestDelta = TrayDelta(i, bestMetric);
+                var bestDelta = incumbentDelta;
                 for (var m = 0; m < 3; m++)
                 {
                     var delta = TrayDelta(i, m);
@@ -283,27 +336,141 @@ public sealed partial class MainWindow : Window
                     }
                 }
 
-                _trayMetrics[i] = bestMetric;
-            }
+                // An incumbent that lost its reading is replaced right away — by
+                // whichever metric still has one, or by "--" when none does.
+                var incumbentLost = incumbentDelta < 0
+                    && _trayShownValues[i * 3 + _trayMetrics[i]] != Na;
+                var fromMetric = _trayMetrics[i];
+                if (bestDelta >= TraySwitchMinDelta || incumbentLost)
+                {
+                    _trayMetrics[i] = bestMetric;
+                    for (var m = 0; m < 3; m++)
+                    {
+                        _trayShownValues[i * 3 + m] = _trayValues[i * 3 + m];
+                    }
 
-            _trayValues.CopyTo(_trayPrevValues, 0);
-            UpdateTrayIcons();
+                    var metric = _trayMetrics[i];
+                    var target = _trayValues[i * 3 + metric];
+                    if (metric != fromMetric || target != _trayGlyphValues[i])
+                    {
+                        BeginTrayFade(
+                            i, _trayGlyphValues[i], TrayMetricColors[fromMetric],
+                            target, TrayMetricColors[metric]);
+                        _trayGlyphValues[i] = target;
+                    }
+                }
+                else if (live)
+                {
+                    // Between selections a visible window keeps the number live —
+                    // a backstop for OnSample, usually a no-op.
+                    RefreshTrayLive(i);
+                }
+            }
         };
         return timer;
     }
 
-    // Change of a metric since the previous tick: -1 = no current reading (never
-    // selected), 255 = a reading just (re)appeared, otherwise |current - previous|.
+    // Starts (or retargets) the fade of icon i toward its current metric/value.
+    // A fade caught mid-flight keeps going: still fading out — only the incoming
+    // glyph is replaced; already fading in — the direction reverses first so the
+    // half-shown glyph leaves the same way it came, with no hard cut.
+    private void BeginTrayFade(int i, byte fromValue, SD.Color fromColor, byte toValue, SD.Color toColor)
+    {
+        if (_trayFades[i] is { } running)
+        {
+            if (running.FadingIn)
+            {
+                running.FromValue = running.ToValue;
+                running.FromColor = running.ToColor;
+                running.FadingIn = false;
+            }
+
+            running.ToValue = toValue;
+            running.ToColor = toColor;
+            return;
+        }
+
+        _trayFades[i] = new TrayFade
+        {
+            FromValue = fromValue,
+            FromColor = fromColor,
+            ToValue = toValue,
+            ToColor = toColor,
+        };
+        _trayFadeTimer ??= CreateTrayFadeTimer();
+        _trayFadeTimer.Start();
+    }
+
+    // Advances every active fade by one frame and stops itself once both icons
+    // are idle again (most of the time this timer is not running at all).
+    private DispatcherQueueTimer CreateTrayFadeTimer()
+    {
+        var timer = _dispatcher.CreateTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(30);
+        timer.Tick += (_, _) =>
+        {
+            if (_exiting)
+            {
+                return;
+            }
+
+            var active = false;
+            for (var i = 0; i < 2; i++)
+            {
+                if (_trayFades[i] is not { } fade)
+                {
+                    continue;
+                }
+
+                if (!fade.FadingIn)
+                {
+                    fade.Opacity -= TrayFadeStep;
+                    if (fade.Opacity <= 0f)
+                    {
+                        fade.Opacity = 0f;
+                        fade.FadingIn = true;
+                    }
+
+                    RenderTrayIcon(i, fade.FromValue, fade.FromColor, fade.Opacity);
+                    active = true;
+                }
+                else
+                {
+                    fade.Opacity += TrayFadeStep;
+                    if (fade.Opacity >= 1f)
+                    {
+                        _trayFades[i] = null;
+                        RenderTrayIcon(i, fade.ToValue, fade.ToColor, 1f);
+                    }
+                    else
+                    {
+                        RenderTrayIcon(i, fade.ToValue, fade.ToColor, fade.Opacity);
+                        active = true;
+                    }
+                }
+            }
+
+            if (!active)
+            {
+                _trayFadeTimer!.Stop();
+            }
+        };
+        return timer;
+    }
+
+    // Drift of a metric from its last-selection baseline: -1 = no current
+    // reading (never selected), 255 = a reading just (re)appeared, otherwise
+    // |current - baseline|.
     private int TrayDelta(int device, int metric)
     {
         var cur = _trayValues[device * 3 + metric];
-        var prev = _trayPrevValues[device * 3 + metric];
+        var shown = _trayShownValues[device * 3 + metric];
         if (cur == Na)
         {
             return -1;
         }
 
-        return prev == Na ? 255 : Math.Abs(cur - prev);
+        return shown == Na ? 255 : Math.Abs(cur - shown);
     }
 
     private void DestroyTrayIconImage(int i)
@@ -332,7 +499,8 @@ public sealed partial class MainWindow : Window
     // (LOAD white / TEMP yellow / MEM violet) — at 16 px tray size a two-digit number
     // stays readable where bars did not. Na renders as a gray "--".
     // The caller owns both the Icon and the HICON (Icon.FromHandle does not take over).
-    private static (SD.Icon Icon, nint Hicon) CreateValueIcon(byte value, SD.Color color)
+    // Opacity below 1 blends the glyph toward the background — the fade frames.
+    private static (SD.Icon Icon, nint Hicon) CreateValueIcon(byte value, SD.Color color, float opacity = 1f)
     {
         const int size = 128;
         const float box = 120f; // target text extent — near full bleed for readability
@@ -347,6 +515,16 @@ public sealed partial class MainWindow : Window
         var na = value == Na;
         var text = na ? "--" : value.ToString();
 
+        var glyph = na ? TrayNaColor : color;
+        if (opacity < 1f)
+        {
+            var t = Math.Max(opacity, 0f);
+            glyph = SD.Color.FromArgb(
+                0x18 + (int)((glyph.R - 0x18) * t),
+                0x18 + (int)((glyph.G - 0x18) * t),
+                0x18 + (int)((glyph.B - 0x18) * t));
+        }
+
         // One measuring pass scales the font so the text fills the box regardless of
         // digit count ("7", "47" and "104" all come out as large as they can be).
         using var probe = new SD.Font("Segoe UI", 80, SD.FontStyle.Bold);
@@ -359,7 +537,7 @@ public sealed partial class MainWindow : Window
             Alignment = SD.StringAlignment.Center,
             LineAlignment = SD.StringAlignment.Center,
         };
-        using var brush = new SD.SolidBrush(na ? TrayNaColor : color);
+        using var brush = new SD.SolidBrush(glyph);
         graphics.DrawString(text, font, brush, new SD.RectangleF(0, 0, size, size), format);
 
         var hicon = bitmap.GetHicon();
@@ -452,6 +630,7 @@ public sealed partial class MainWindow : Window
         _exiting = true;
         _titleTimer?.Stop();
         _trayTimer?.Stop();
+        _trayFadeTimer?.Stop();
         DisposeTrays();
         _client.Stop();
         _hardware.Dispose();
@@ -476,6 +655,7 @@ public sealed partial class MainWindow : Window
         _exiting = true;
         _titleTimer?.Stop();
         _trayTimer?.Stop();
+        _trayFadeTimer?.Stop();
         DisposeTrays();
         _client.Stop();
         _hardware.Dispose();
@@ -508,9 +688,17 @@ public sealed partial class MainWindow : Window
                 gpuTray.ToolTipText = $"GPU {Pct(s.GpuLoad)} {Deg(s.GpuTemp)} {Pct(s.VramUsed)}";
             }
 
-            // The tray icons are deliberately NOT redrawn here: the value shown in a
-            // cycle slot is frozen for the whole slot — only the timer tick rerenders
-            // them, picking the latest sample at that moment.
+            // While the window is visible the icons run live and update together
+            // with the table above; hidden, they are redrawn only by the timer
+            // tick, and only when a metric has drifted far enough from the value
+            // stored at the last redraw (see CreateTrayTimer).
+            if (AppWindow.IsVisible)
+            {
+                for (var i = 0; i < 2; i++)
+                {
+                    RefreshTrayLive(i);
+                }
+            }
 
             // While connected the chart is fed from delivered frames (OnFrameSent);
             // local samples feed it only in the disconnected fallback.
