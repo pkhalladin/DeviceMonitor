@@ -45,17 +45,18 @@ public sealed partial class MainWindow : Window
     private readonly nint[] _trayHicons = new nint[2];
 
     // Each icon shows one metric (0 load, 1 temp, 2 mem) as a big number. While
-    // the window is hidden the icon is frozen: it redraws only when some metric
-    // drifts at least TraySwitchMinDelta away from the value stored at the last
-    // redraw — then it switches to the metric that drifted the most (incumbent
-    // wins ties). While the window is visible the number runs LIVE with every
-    // sample (the same numbers the window shows); the drift rule keeps deciding
-    // which metric is on the icon.
+    // the window is visible the icon is LIVE: it shows the current reading of
+    // the metric that moved the most in the last tick (the same numbers the
+    // window shows). While the window is hidden the icon freezes: it redraws
+    // only when some metric drifts at least TraySwitchMinDelta away from the
+    // value stored at the last redraw, switching to the metric that drifted
+    // the most. Ties always keep the incumbent.
     private readonly int[] _trayMetrics = new int[2];
-    // Minimum accumulated drift needed to redraw a hidden icon / re-pick its
-    // metric (keeps 1-2 point jitter from flipping the value or color).
+    // Minimum accumulated drift needed to redraw the icon while the window is
+    // hidden (keeps 1-2 point jitter from flipping the value or color).
     private const int TraySwitchMinDelta = 3;
-    // Values as of the last (re)selection — the comparison base for the drifts.
+    // The drift baseline: hidden, values as of the icon's last redraw; live,
+    // refreshed every tick (drift then degenerates to the last second's move).
     private readonly byte[] _trayShownValues = { Na, Na, Na, Na, Na, Na };
     // The value actually drawn on each icon (the last fade target) — the "from"
     // of the next fade and the guard against redundant redraws.
@@ -303,11 +304,10 @@ public sealed partial class MainWindow : Window
         _trayHicons[i] = hicon;
     }
 
-    // Each tick checks, per device, how far each metric has drifted from the
-    // value stored at the last redraw and re-picks the metric once the largest
-    // drift reaches TraySwitchMinDelta. Hidden, that is also the only thing that
-    // ever redraws an icon; visible, the number additionally runs live from
-    // OnSample between selections.
+    // Each tick re-picks, per device, which metric its icon tracks. Visible
+    // window: any move re-picks (largest move of the last tick wins) and the
+    // number runs live. Hidden: the icon stays frozen until some metric drifts
+    // at least TraySwitchMinDelta from the value stored at the last redraw.
     private DispatcherQueueTimer CreateTrayTimer()
     {
         var timer = _dispatcher.CreateTimer();
@@ -336,34 +336,33 @@ public sealed partial class MainWindow : Window
                     }
                 }
 
-                // An incumbent that lost its reading is replaced right away — by
-                // whichever metric still has one, or by "--" when none does.
+                // Hidden, a redraw needs an accumulated drift of TraySwitchMinDelta
+                // or an incumbent whose reading went dark (then any live metric —
+                // or "--" — takes over at once). Live, there is no threshold and
+                // the baseline chases the raw values every tick, so the drift is
+                // just "the last second's move" and the icon simply tracks
+                // whichever metric moved the most a moment ago.
                 var incumbentLost = incumbentDelta < 0
                     && _trayShownValues[i * 3 + _trayMetrics[i]] != Na;
-                var fromMetric = _trayMetrics[i];
-                if (bestDelta >= TraySwitchMinDelta || incumbentLost)
+                if (!live && bestDelta < TraySwitchMinDelta && !incumbentLost)
                 {
-                    _trayMetrics[i] = bestMetric;
-                    for (var m = 0; m < 3; m++)
-                    {
-                        _trayShownValues[i * 3 + m] = _trayValues[i * 3 + m];
-                    }
-
-                    var metric = _trayMetrics[i];
-                    var target = _trayValues[i * 3 + metric];
-                    if (metric != fromMetric || target != _trayGlyphValues[i])
-                    {
-                        BeginTrayFade(
-                            i, _trayGlyphValues[i], TrayMetricColors[fromMetric],
-                            target, TrayMetricColors[metric]);
-                        _trayGlyphValues[i] = target;
-                    }
+                    continue;
                 }
-                else if (live)
+
+                var fromMetric = _trayMetrics[i];
+                _trayMetrics[i] = bestMetric;
+                for (var m = 0; m < 3; m++)
                 {
-                    // Between selections a visible window keeps the number live —
-                    // a backstop for OnSample, usually a no-op.
-                    RefreshTrayLive(i);
+                    _trayShownValues[i * 3 + m] = _trayValues[i * 3 + m];
+                }
+
+                var target = _trayValues[i * 3 + bestMetric];
+                if (bestMetric != fromMetric || target != _trayGlyphValues[i])
+                {
+                    BeginTrayFade(
+                        i, _trayGlyphValues[i], TrayMetricColors[fromMetric],
+                        target, TrayMetricColors[bestMetric]);
+                    _trayGlyphValues[i] = target;
                 }
             }
         };
