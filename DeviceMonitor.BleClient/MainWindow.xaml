@@ -87,7 +87,7 @@
                     <TextBlock x:Name="ChartTitle" Text="CPU" Foreground="#808080" FontSize="22" />
                     <TextBlock Text="LOAD" Foreground="#FEFEFE" FontSize="14" VerticalAlignment="Center" />
                     <TextBlock Text="TEMP" Foreground="#FFFF00" FontSize="14" VerticalAlignment="Center" />
-                    <TextBlock Text="MEM"  Foreground="#C500E6" FontSize="14" VerticalAlignment="Center" />
+                    <TextBlock Text="MEM"  Foreground="#D966FF" FontSize="14" VerticalAlignment="Center" />
                 </StackPanel>
 
                 <Canvas x:Name="PlotCanvas" Grid.Row="1" Margin="0,8,0,0"

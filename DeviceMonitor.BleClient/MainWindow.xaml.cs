@@ -1,6 +1,7 @@
 using System;
 using System.Runtime.InteropServices;
 using H.NotifyIcon;
+using H.NotifyIcon.Core;
 using Microsoft.UI.Dispatching;
 using Microsoft.UI.Input;
 using Microsoft.UI.Windowing;
@@ -26,26 +27,27 @@ public sealed partial class MainWindow : Window
     // Per-column value colors (match the device screen); gray is used for "--" (no reading).
     private static readonly SolidColorBrush LoadBrush = new(Color.FromArgb(0xFF, 0xFF, 0xFF, 0xFF)); // white
     private static readonly SolidColorBrush TempBrush = new(Color.FromArgb(0xFF, 0xFF, 0xFF, 0x00)); // yellow
-    private static readonly SolidColorBrush MemBrush  = new(Color.FromArgb(0xFF, 0xC5, 0x00, 0xE6)); // violet
+    private static readonly SolidColorBrush MemBrush  = new(Color.FromArgb(0xFF, 0xD9, 0x66, 0xFF)); // violet (brighter than the device's — the dark hue is too dim on a desktop screen)
     private static readonly SolidColorBrush NaBrush   = new(Color.FromArgb(0xFF, 0x80, 0x80, 0x80)); // gray
 
     private static readonly SolidColorBrush AxisBrush = new(Color.FromArgb(0xFF, 0x3A, 0x3A, 0x3A)); // dark gray
 
-    private TaskbarIcon? _tray;
     private bool _trayCreated;
     private bool _exiting;
 
-    // ---- Tray icon (tracks the view: DM badge / CPU bars / GPU bars; see UpdateTrayIcon) ----
+    // ---- Tray icons (two permanent icons: [0] CPU, [1] GPU; see UpdateTrayIcons) ----
     // Latest sample in BLE frame order: cpuLoad, cpuTemp, ramUsed, gpuLoad, gpuTemp, vramUsed.
     private readonly byte[] _trayValues = { Na, Na, Na, Na, Na, Na };
-    // Icon.FromHandle does not own the HICON, so the handle is kept alongside the Icon
-    // and both are released explicitly on every swap (a leak here grows ~1 GDI object/s).
-    private SD.Icon? _trayIcon;
-    private nint _trayHicon;
+    private readonly TaskbarIcon?[] _trays = new TaskbarIcon?[2];
+    // Icon.FromHandle does not own the HICON, so each handle is kept alongside its Icon
+    // and both are released explicitly on every swap (a leak here grows ~2 GDI objects/s).
+    private readonly SD.Icon?[] _trayIcons = new SD.Icon?[2];
+    private readonly nint[] _trayHicons = new nint[2];
 
-    // Chart-view icon shows one metric at a time (0 load, 1 temp, 2 mem) as a big
-    // number, advanced by _trayTimer; Na metrics are skipped so a missing sensor
-    // does not waste a slot in the cycle.
+    // Both icons show one metric at a time (0 load, 1 temp, 2 mem) as a big number,
+    // advanced in lockstep by _trayTimer (same metric, same color on both at any
+    // moment); a metric with no reading on either device is skipped so it does not
+    // waste a slot in the cycle.
     private int _trayMetric;
     private DispatcherQueueTimer? _trayTimer;
 
@@ -54,7 +56,7 @@ public sealed partial class MainWindow : Window
     {
         SD.Color.FromArgb(0xFF, 0xFF, 0xFF), // load
         SD.Color.FromArgb(0xFF, 0xFF, 0x00), // temp
-        SD.Color.FromArgb(0xC5, 0x00, 0xE6), // mem
+        SD.Color.FromArgb(0xD9, 0x66, 0xFF), // mem
     };
     private static readonly SD.Color TrayNaColor = SD.Color.FromArgb(0x80, 0x80, 0x80);
 
@@ -196,86 +198,114 @@ public sealed partial class MainWindow : Window
 
     private void CreateTrayIcon()
     {
-        _tray = new TaskbarIcon
+        // Two icons, created GPU first then CPU — on this shell that puts CPU on the
+        // left. Each needs its own fixed Guid (the default Id is derived from the
+        // process path, so two icons would collide). New icons may land in the
+        // overflow until the user pins them.
+        for (var i = 1; i >= 0; i--)
         {
-            ToolTipText = "DeviceMonitor",
-            ContextFlyout = BuildTrayMenu(),
-            LeftClickCommand = new RelayCommand(ShowMainWindow),
-            DoubleClickCommand = new RelayCommand(ShowMainWindow),
-            NoLeftClickDelay = true,
-        };
+            var device = i == 0 ? "CPU" : "GPU";
+            _trays[i] = new TaskbarIcon
+            {
+                Id = TrayIcon.CreateUniqueGuidFromString("DeviceMonitor.BleClient." + device),
+                ToolTipText = device,
+                ContextFlyout = BuildTrayMenu(),
+                LeftClickCommand = new RelayCommand(ShowMainWindow),
+                DoubleClickCommand = new RelayCommand(ShowMainWindow),
+                NoLeftClickDelay = true,
+            };
+        }
 
-        UpdateTrayIcon(); // startup is the table view, so this draws the DM badge
-        _tray.ForceCreate();
+        UpdateTrayIcons(); // both start as a gray "--" until the first sample lands
+        for (var i = 1; i >= 0; i--)
+        {
+            _trays[i]!.ForceCreate(); // GPU registers first — see the ordering note above
+        }
+
+        _trayTimer = CreateTrayTimer();
+        _trayTimer.Start();
     }
 
-    // Redraws the tray icon for the current view and swaps it in: the DM badge on the
-    // table view, the currently cycled metric value on the CPU/GPU chart views.
-    // The previous Icon/HICON pair is released only after the swap (the shell keeps its
-    // own copy of the icon).
-    private void UpdateTrayIcon()
+    // Redraws both tray icons with the currently cycled metric and swaps them in.
+    // The previous Icon/HICON pair is released only after the swap (the shell keeps
+    // its own copy of the icon).
+    private void UpdateTrayIcons()
     {
-        if (_exiting || _tray is null)
+        if (_exiting)
         {
             return;
         }
 
-        var (icon, hicon) = _view == 0
-            ? CreateDmIcon()
-            : CreateValueIcon(
-                _trayValues[(_view - 1) * 3 + _trayMetric], TrayMetricColors[_trayMetric]);
-        _tray.Icon = icon;
-        DestroyTrayIconImage();
-        _trayIcon = icon;
-        _trayHicon = hicon;
+        for (var i = 0; i < 2; i++)
+        {
+            if (_trays[i] is not { } tray)
+            {
+                continue;
+            }
+
+            var (icon, hicon) = CreateValueIcon(
+                _trayValues[i * 3 + _trayMetric], TrayMetricColors[_trayMetric]);
+            tray.Icon = icon;
+            DestroyTrayIconImage(i);
+            _trayIcons[i] = icon;
+            _trayHicons[i] = hicon;
+        }
     }
 
-    // Advances the tray cycle to the next metric that has a reading (all-Na keeps the
-    // current one) and redraws. Runs only while a chart view is active; see ApplyView.
+    // Advances the shared cycle to the next metric and redraws both icons. A slot is
+    // skipped only when the metric has no reading on either device — a sensor missing
+    // on just one of them shows as "--" there, keeping the two icons in lockstep.
     private DispatcherQueueTimer CreateTrayTimer()
     {
         var timer = _dispatcher.CreateTimer();
         timer.Interval = TimeSpan.FromSeconds(1);
         timer.Tick += (_, _) =>
         {
-            if (_exiting || _view == 0)
+            if (_exiting)
             {
                 return;
             }
 
-            var chartBase = (_view - 1) * 3;
             for (var step = 1; step <= 3; step++)
             {
                 var next = (_trayMetric + step) % 3;
-                if (_trayValues[chartBase + next] != Na)
+                if (_trayValues[next] != Na || _trayValues[3 + next] != Na)
                 {
                     _trayMetric = next;
                     break;
                 }
             }
 
-            UpdateTrayIcon();
+            UpdateTrayIcons();
         };
         return timer;
     }
 
-    private void DestroyTrayIconImage()
+    private void DestroyTrayIconImage(int i)
     {
-        _trayIcon?.Dispose();
-        _trayIcon = null;
-        if (_trayHicon != 0)
+        _trayIcons[i]?.Dispose();
+        _trayIcons[i] = null;
+        if (_trayHicons[i] != 0)
         {
-            DestroyIcon(_trayHicon);
-            _trayHicon = 0;
+            DestroyIcon(_trayHicons[i]);
+            _trayHicons[i] = 0;
+        }
+    }
+
+    private void DestroyTrayIconImages()
+    {
+        for (var i = 0; i < 2; i++)
+        {
+            DestroyTrayIconImage(i);
         }
     }
 
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(nint hIcon);
 
-    // Live tray icon for a chart view: the cycled metric's value as one big number in
-    // the metric color (LOAD white / TEMP yellow / MEM violet) — at 16 px tray size a
-    // two-digit number stays readable where bars did not. Na renders as a gray "--".
+    // Tray icon image: the cycled metric's value as one big number in the metric color
+    // (LOAD white / TEMP yellow / MEM violet) — at 16 px tray size a two-digit number
+    // stays readable where bars did not. Na renders as a gray "--".
     // The caller owns both the Icon and the HICON (Icon.FromHandle does not take over).
     private static (SD.Icon Icon, nint Hicon) CreateValueIcon(byte value, SD.Color color)
     {
@@ -306,32 +336,6 @@ public sealed partial class MainWindow : Window
         };
         using var brush = new SD.SolidBrush(na ? TrayNaColor : color);
         graphics.DrawString(text, font, brush, new SD.RectangleF(0, 0, size, size), format);
-
-        var hicon = bitmap.GetHicon();
-        return (SD.Icon.FromHandle(hicon), hicon);
-    }
-
-    // GeneratedIconSource always passes a text rectangle to the generator, which then
-    // draws the text top-left instead of centered — so the icon is drawn by hand here.
-    private static (SD.Icon Icon, nint Hicon) CreateDmIcon()
-    {
-        const int size = 128;
-        using var bitmap = new SD.Bitmap(size, size);
-        using var graphics = SD.Graphics.FromImage(bitmap);
-        graphics.SmoothingMode = SD.Drawing2D.SmoothingMode.AntiAlias;
-        graphics.TextRenderingHint = SD.Text.TextRenderingHint.AntiAliasGridFit;
-
-        using var background = new SD.SolidBrush(SD.Color.DarkSlateBlue);
-        graphics.FillEllipse(background, 0, 0, size, size);
-
-        using var font = new SD.Font("Segoe UI", 36, SD.FontStyle.Bold);
-        using var format = new SD.StringFormat
-        {
-            Alignment = SD.StringAlignment.Center,
-            LineAlignment = SD.StringAlignment.Center,
-        };
-        graphics.DrawString("DM", font, SD.Brushes.White,
-            new SD.RectangleF(0, 0, size, size), format);
 
         var hicon = bitmap.GetHicon();
         return (SD.Icon.FromHandle(hicon), hicon);
@@ -423,12 +427,21 @@ public sealed partial class MainWindow : Window
         _exiting = true;
         _titleTimer?.Stop();
         _trayTimer?.Stop();
-        _tray?.Dispose();
-        _tray = null;
-        DestroyTrayIconImage();
+        DisposeTrays();
         _client.Stop();
         _hardware.Dispose();
         Application.Current.Exit();
+    }
+
+    private void DisposeTrays()
+    {
+        for (var i = 0; i < 2; i++)
+        {
+            _trays[i]?.Dispose();
+            _trays[i] = null;
+        }
+
+        DestroyTrayIconImages();
     }
 
     private void OnClosed(object sender, WindowEventArgs args)
@@ -438,9 +451,7 @@ public sealed partial class MainWindow : Window
         _exiting = true;
         _titleTimer?.Stop();
         _trayTimer?.Stop();
-        _tray?.Dispose();
-        _tray = null;
-        DestroyTrayIconImage();
+        DisposeTrays();
         _client.Stop();
         _hardware.Dispose();
     }
@@ -462,17 +473,19 @@ public sealed partial class MainWindow : Window
             SetCell(GpuMem, Value(s.VramUsed), MemBrush);
 
             s.ToPayload().CopyTo(_trayValues, 0);
-            if (_tray is not null)
+            if (_trays[0] is { } cpuTray)
             {
-                _tray.ToolTipText =
-                    $"CPU {Pct(s.CpuLoad)} {Deg(s.CpuTemp)} {Pct(s.RamUsed)} · " +
-                    $"GPU {Pct(s.GpuLoad)} {Deg(s.GpuTemp)} {Pct(s.VramUsed)}";
+                cpuTray.ToolTipText = $"CPU {Pct(s.CpuLoad)} {Deg(s.CpuTemp)} {Pct(s.RamUsed)}";
             }
 
-            if (_view != 0)
+            if (_trays[1] is { } gpuTray)
             {
-                UpdateTrayIcon(); // the number tracks the sample; the table's DM badge is static
+                gpuTray.ToolTipText = $"GPU {Pct(s.GpuLoad)} {Deg(s.GpuTemp)} {Pct(s.VramUsed)}";
             }
+
+            // The tray icons are deliberately NOT redrawn here: the value shown in a
+            // cycle slot is frozen for the whole slot — only the timer tick rerenders
+            // them, picking the latest sample at that moment.
 
             // While connected the chart is fed from delivered frames (OnFrameSent);
             // local samples feed it only in the disconnected fallback.
@@ -566,15 +579,7 @@ public sealed partial class MainWindow : Window
         {
             ChartTitle.Text = _view == 1 ? "CPU" : "GPU";
             RedrawChart();
-            _trayMetric = 0; // each chart view starts its tray cycle at LOAD
-            (_trayTimer ??= CreateTrayTimer()).Start();
         }
-        else
-        {
-            _trayTimer?.Stop();
-        }
-
-        UpdateTrayIcon();
     }
 
     private void OnPlotSizeChanged(object sender, SizeChangedEventArgs e)
