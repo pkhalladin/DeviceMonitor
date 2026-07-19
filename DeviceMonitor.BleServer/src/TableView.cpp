@@ -115,7 +115,8 @@ void TableView::cancelAnimations() {
   }
 }
 
-void TableView::tickAnimations(Arduino_GFX &gfx, uint32_t nowMs) {
+bool TableView::tickAnimations(Arduino_GFX &gfx, uint32_t nowMs) {
+  bool drew = false;
   for (size_t m = 0; m < MetricsFrame::Count; m++) {
     CellAnim &anim = _anims[m];
     if (anim.phase == CellAnim::Idle) {
@@ -177,7 +178,9 @@ void TableView::tickAnimations(Arduino_GFX &gfx, uint32_t nowMs) {
     int x, y, w, h;
     cellRect(gfx, (int)m, x, y, w, h);
     drawCell(gfx, x, y, w, h, value, (int)(m % 3), level);
+    drew = true;
   }
+  return drew;
 }
 
 void TableView::drawHeaderLabel(Arduino_GFX &gfx, int x, int width, const char *text) {

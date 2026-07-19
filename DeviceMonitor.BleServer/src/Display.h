@@ -6,6 +6,11 @@
 // MISO unused), rotation 1 = landscape 320x172, IPS (color inversion on), column offset
 // 34 / row offset 0. Also owns the backlight PWM.
 //
+// All drawing goes to a full-screen RGB565 canvas in RAM (320x172x2 = ~108 KB of the
+// C6's 512 KB SRAM); flush() pushes the finished frame to the panel in one SPI burst
+// (~20 ms at 40 MHz). Nothing draws to the panel directly, so a cleared-then-redrawn
+// cell or chart never shows half-painted — no flicker.
+//
 // Pin map: MOSI=6  SCLK=7  CS=14  DC=15  RST=21  BLK(backlight)=22
 class Display {
 public:
@@ -13,7 +18,11 @@ public:
 
   void begin();
 
-  Arduino_GFX &gfx() { return _panel; }
+  Arduino_GFX &gfx() { return _canvas; }
+
+  // Pushes the canvas to the panel. Call once per loop tick after drawing;
+  // skip it when nothing drew (the panel keeps showing its last frame).
+  void flush() { _canvas.flush(); }
 
 private:
   static constexpr int8_t PinMosi = 6;
@@ -28,4 +37,5 @@ private:
 
   Arduino_ESP32SPI _bus;
   Arduino_ST7789 _panel;
+  Arduino_Canvas _canvas;  // rotation 0: the panel's MADCTL already maps landscape
 };

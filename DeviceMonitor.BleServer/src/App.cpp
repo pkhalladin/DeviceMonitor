@@ -10,6 +10,7 @@ void App::begin() {
   _button.begin();
   _display.begin();
   _views[_viewIndex]->drawFull(_display.gfx());  // no client yet -> all "--"
+  _display.flush();
 
   _ble.begin();
   Serial.print("BLE advertising as ");
@@ -68,16 +69,23 @@ void App::consumeBleState() {
 }
 
 void App::render() {
+  bool drew = false;
   if (_fullRedraw) {  // BOOT pressed: full repaint of the new view
     _fullRedraw = false;
     _dirty = false;
     _views[_viewIndex]->drawFull(_display.gfx());
+    drew = true;
   } else if (_dirty) {  // fresh data (or link change): update the current view
     _dirty = false;
     _views[_viewIndex]->drawContent(_display.gfx());
+    drew = true;
   }
 
   if (_viewIndex == 0) {  // fast no-op while every cell is idle
-    _tableView.tickAnimations(_display.gfx(), millis());
+    drew |= _tableView.tickAnimations(_display.gfx(), millis());
+  }
+
+  if (drew) {
+    _display.flush();  // one SPI burst per changed frame; idle ticks skip it
   }
 }

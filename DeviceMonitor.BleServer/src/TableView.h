@@ -36,7 +36,8 @@ public:
   // Drops every running fade without drawing (the caller repaints or the view is hidden).
   void cancelAnimations();
   // Advances every running fade; call each loop tick while this view is active.
-  void tickAnimations(Arduino_GFX &gfx, uint32_t nowMs);
+  // Returns true when anything was drawn (the caller then flushes the canvas).
+  bool tickAnimations(Arduino_GFX &gfx, uint32_t nowMs);
 
 private:
   static constexpr int LabelColumnWidth = 48;  // left column holding the CPU/GPU row labels
