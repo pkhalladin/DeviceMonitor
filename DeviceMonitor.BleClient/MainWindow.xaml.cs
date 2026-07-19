@@ -354,6 +354,17 @@ public sealed partial class MainWindow : Window
                 return;
             }
 
+            if (toValue == running.FromValue && toColor == running.FromColor)
+            {
+                // The target bounced back to the glyph still on screen — just
+                // brighten it back (a same-value out-and-in dip reads as noise).
+                running.ToValue = running.FromValue;
+                running.ToColor = running.FromColor;
+                running.Step = step;
+                running.FadingIn = true;
+                return;
+            }
+
             running.ToValue = toValue;
             running.ToColor = toColor;
             running.Step = step;
@@ -383,6 +394,17 @@ public sealed partial class MainWindow : Window
                 running.PendingText = toText;
                 running.PendingBrush = toBrush;
                 running.PendingStep = step;
+                return;
+            }
+
+            if (toText == _cellBlocks[m].Text)
+            {
+                // Bounced back to the text still on screen (the dip swap has not
+                // happened yet) — brighten it back instead of a same-value dip.
+                running.ToText = toText;
+                running.ToBrush = toBrush;
+                running.Step = step;
+                running.FadingIn = true;
                 return;
             }
 

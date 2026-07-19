@@ -91,13 +91,20 @@ void TableView::onFrame(const MetricsFrame &prev, uint32_t nowMs) {
       continue;
     }
 
-    // Still fading out — the incoming glyph has not shown yet: swap it and keep
-    // the outgoing glyph's brightness at the new delta's pace (back-dated start).
+    // Still fading out — the incoming glyph has not shown yet. Keep the outgoing
+    // glyph's brightness at the new delta's pace (back-dated start) and either
+    // swap the incoming glyph, or — if the target bounced back to the glyph
+    // still on screen — brighten it back instead of a same-value dip.
     const uint32_t elapsed = nowMs - anim.phaseStartMs;
     const uint32_t progress = elapsed >= anim.halfMs ? 255 : elapsed * 255 / anim.halfMs;
     anim.toValue = cur;
     anim.halfMs = half;
-    anim.phaseStartMs = nowMs - progress * half / 255;
+    if (cur == anim.fromValue) {
+      anim.phase = CellAnim::In;
+      anim.phaseStartMs = nowMs - (255 - progress) * half / 255;
+    } else {
+      anim.phaseStartMs = nowMs - progress * half / 255;
+    }
   }
 }
 
