@@ -36,37 +36,44 @@ public sealed partial class MainWindow : Window
     private bool _exiting;
 
     // ---- Tray icons (two permanent icons: [0] CPU, [1] GPU; see UpdateTrayIcons) ----
-    // Latest sample in BLE frame order: cpuLoad, cpuTemp, ramUsed, gpuLoad, gpuTemp, vramUsed.
-    private readonly byte[] _trayValues = { Na, Na, Na, Na, Na, Na };
+    // Previous sample while OnSample runs, latest sample afterwards. BLE frame
+    // order: cpuLoad, cpuTemp, ramUsed, gpuLoad, gpuTemp, vramUsed.
+    private readonly byte[] _lastSample = { Na, Na, Na, Na, Na, Na };
     private readonly TaskbarIcon?[] _trays = new TaskbarIcon?[2];
     // Icon.FromHandle does not own the HICON, so each handle is kept alongside its Icon
     // and both are released explicitly on every swap (a leak here grows ~2 GDI objects/s).
     private readonly SD.Icon?[] _trayIcons = new SD.Icon?[2];
     private readonly nint[] _trayHicons = new nint[2];
 
-    // Each icon shows one metric (0 load, 1 temp, 2 mem) as a big number. While
-    // the window is visible the icon is LIVE: it shows the current reading of
-    // the metric that moved the most in the last tick (the same numbers the
-    // window shows). While the window is hidden the icon freezes: it redraws
-    // only when some metric drifts at least TraySwitchMinDelta away from the
-    // value stored at the last redraw, switching to the metric that drifted
-    // the most. Ties always keep the incumbent.
+    // Each icon shows one metric (0 load, 1 temp, 2 mem) as a big number: on
+    // every sample, the metric whose reading moved the most since the previous
+    // sample (ties resolve load > temp > mem). All deltas zero — the icon keeps
+    // its current metric and value. Window visible or hidden behaves the same.
     private readonly int[] _trayMetrics = new int[2];
-    // Minimum accumulated drift needed to redraw the icon while the window is
-    // hidden (keeps 1-2 point jitter from flipping the value or color).
-    private const int TraySwitchMinDelta = 3;
-    // The drift baseline: hidden, values as of the icon's last redraw; live,
-    // refreshed every tick (drift then degenerates to the last second's move).
-    private readonly byte[] _trayShownValues = { Na, Na, Na, Na, Na, Na };
+    // Samples left before the metric race reopens after a switch. A fade lasts
+    // at least as long as the sample interval, so without this hold a metric
+    // that wins a single race would be retargeted away before its glyph is ever
+    // drawn (fading out the incumbent alone can take 1.5 s). The fresh winner
+    // keeps the icon for its whole fade plus a beat at full brightness; its own
+    // value still updates while held. The hold is voided if its reading goes dark.
+    private readonly int[] _trayHoldTicks = new int[2];
     // The value actually drawn on each icon (the last fade target) — the "from"
     // of the next fade and the guard against redundant redraws.
     private readonly byte[] _trayGlyphValues = { Na, Na };
-    private DispatcherQueueTimer? _trayTimer;
 
-    // A redraw does not swap the icon instantly: the old glyph fades into the
-    // background, then the new one fades out of it (~300 ms each way; see
-    // BeginTrayFade). One shared 30 ms timer drives both icons and runs only
-    // while something is animating.
+    // A value change does not swap the glyph instantly: the old glyph fades into
+    // the background, then the new one fades out of it. The total fade lasts
+    // max(1, TransitionFactor / delta) seconds — small moves drift slowly, big
+    // moves settle in a second. A glyph that started fading in always lands and
+    // rests a second at full brightness so the value can actually be read;
+    // changes landing during the fade-in or the rest wait as the pending target
+    // (last one wins) and fade only after the rest ends. One shared 30 ms timer
+    // drives the two tray icons and the six window cells, and runs only while
+    // something is animating or resting.
+    private const double TransitionFactor = 3.0; // seconds at delta 1, clamped to >= 1 s
+    private const double FadeFrameMs = 30.0;     // must match the _fadeTimer interval
+    private const int RestFrameCount = 33;       // ~1 s of linger after a finished fade
+
     private sealed class TrayFade
     {
         public byte FromValue;
@@ -75,11 +82,34 @@ public sealed partial class MainWindow : Window
         public SD.Color ToColor;
         public float Opacity = 1f; // of the glyph drawn right now
         public bool FadingIn;      // false = the old glyph is still fading out
+        public float Step;         // opacity per 30 ms frame (see FadeStep)
+        public int RestFrames;     // > 0 = fade done, value lingering fully visible
+        public bool HasPending;    // a change arrived during the rest
+        public byte PendingValue;
+        public SD.Color PendingColor;
+        public float PendingStep;
+    }
+
+    // Same fade, applied to a window cell: the TextBlock's opacity dips to zero,
+    // the text and brush swap there, and the opacity climbs back.
+    private sealed class CellFade
+    {
+        public string ToText = "";
+        public SolidColorBrush ToBrush = NaBrush;
+        public float Opacity = 1f;
+        public bool FadingIn;
+        public float Step;
+        public int RestFrames;
+        public bool HasPending;
+        public string PendingText = "";
+        public SolidColorBrush PendingBrush = NaBrush;
+        public float PendingStep;
     }
 
     private readonly TrayFade?[] _trayFades = new TrayFade?[2];
-    private DispatcherQueueTimer? _trayFadeTimer;
-    private const float TrayFadeStep = 0.1f; // opacity per 30 ms frame → 10 frames a phase
+    private readonly CellFade?[] _cellFades = new CellFade?[6];
+    private TextBlock[] _cellBlocks = null!; // the six value cells in metric order
+    private DispatcherQueueTimer? _fadeTimer;
 
     // Metric palette as System.Drawing colors (same values as the brushes above).
     private static readonly SD.Color[] TrayMetricColors =
@@ -121,6 +151,7 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
         _dispatcher = DispatcherQueue.GetForCurrentThread();
+        _cellBlocks = new[] { CpuLoad, CpuTemp, CpuMem, GpuLoad, GpuTemp, GpuMem };
 
         _hardware = new HardwareMonitorService();
         _hardware.Updated += OnSample;
@@ -251,9 +282,6 @@ public sealed partial class MainWindow : Window
         {
             _trays[i]!.ForceCreate(); // GPU registers first — see the ordering note above
         }
-
-        _trayTimer = CreateTrayTimer();
-        _trayTimer.Start();
     }
 
     private void UpdateTrayIcons()
@@ -266,26 +294,9 @@ public sealed partial class MainWindow : Window
 
     private void UpdateTrayIcon(int i)
     {
-        var value = _trayValues[i * 3 + _trayMetrics[i]];
+        var value = _lastSample[i * 3 + _trayMetrics[i]];
         _trayGlyphValues[i] = value;
         RenderTrayIcon(i, value, TrayMetricColors[_trayMetrics[i]], 1f);
-    }
-
-    // Live-mode refresh (window visible): fades the icon to the raw reading of
-    // its current metric as soon as it changes.
-    private void RefreshTrayLive(int i)
-    {
-        var metric = _trayMetrics[i];
-        var target = _trayValues[i * 3 + metric];
-        if (target == _trayGlyphValues[i])
-        {
-            return;
-        }
-
-        BeginTrayFade(
-            i, _trayGlyphValues[i], TrayMetricColors[metric],
-            target, TrayMetricColors[metric]);
-        _trayGlyphValues[i] = target;
     }
 
     // Draws one tray icon frame and swaps it in. The previous Icon/HICON pair is
@@ -304,88 +315,48 @@ public sealed partial class MainWindow : Window
         _trayHicons[i] = hicon;
     }
 
-    // Each tick re-picks, per device, which metric its icon tracks. Visible
-    // window: any move re-picks (largest move of the last tick wins) and the
-    // number runs live. Hidden: the icon stays frozen until some metric drifts
-    // at least TraySwitchMinDelta from the value stored at the last redraw.
-    private DispatcherQueueTimer CreateTrayTimer()
+    // Per-metric change between consecutive samples; a reading appearing or
+    // disappearing counts as the maximum move.
+    private static int SampleDelta(byte prev, byte cur) =>
+        prev == cur ? 0
+        : prev == Na || cur == Na ? 255
+        : Math.Abs(cur - prev);
+
+    // Opacity step per 30 ms frame such that a full fade (out + in) lasts
+    // max(1, TransitionFactor / delta) seconds. delta > 0.
+    private static float FadeStep(int delta)
     {
-        var timer = _dispatcher.CreateTimer();
-        timer.Interval = TimeSpan.FromSeconds(1);
-        timer.Tick += (_, _) =>
-        {
-            if (_exiting)
-            {
-                return;
-            }
-
-            var live = AppWindow.IsVisible;
-            for (var i = 0; i < 2; i++)
-            {
-                // Start from the incumbent so a tie does not switch the metric.
-                var incumbentDelta = TrayDelta(i, _trayMetrics[i]);
-                var bestMetric = _trayMetrics[i];
-                var bestDelta = incumbentDelta;
-                for (var m = 0; m < 3; m++)
-                {
-                    var delta = TrayDelta(i, m);
-                    if (delta > bestDelta)
-                    {
-                        bestDelta = delta;
-                        bestMetric = m;
-                    }
-                }
-
-                // Hidden, a redraw needs an accumulated drift of TraySwitchMinDelta
-                // or an incumbent whose reading went dark (then any live metric —
-                // or "--" — takes over at once). Live, there is no threshold and
-                // the baseline chases the raw values every tick, so the drift is
-                // just "the last second's move" and the icon simply tracks
-                // whichever metric moved the most a moment ago.
-                var incumbentLost = incumbentDelta < 0
-                    && _trayShownValues[i * 3 + _trayMetrics[i]] != Na;
-                if (!live && bestDelta < TraySwitchMinDelta && !incumbentLost)
-                {
-                    continue;
-                }
-
-                var fromMetric = _trayMetrics[i];
-                _trayMetrics[i] = bestMetric;
-                for (var m = 0; m < 3; m++)
-                {
-                    _trayShownValues[i * 3 + m] = _trayValues[i * 3 + m];
-                }
-
-                var target = _trayValues[i * 3 + bestMetric];
-                if (bestMetric != fromMetric || target != _trayGlyphValues[i])
-                {
-                    BeginTrayFade(
-                        i, _trayGlyphValues[i], TrayMetricColors[fromMetric],
-                        target, TrayMetricColors[bestMetric]);
-                    _trayGlyphValues[i] = target;
-                }
-            }
-        };
-        return timer;
+        var transition = Math.Max(1.0, TransitionFactor / delta);
+        return (float)(FadeFrameMs / (transition * 500.0));
     }
 
+    // How many samples a fresh race winner holds the icon: the fade's length
+    // (samples arrive ~1/s) plus one sample fully visible.
+    private static int HoldTicks(int delta) =>
+        (int)Math.Ceiling(Math.Max(1.0, TransitionFactor / delta)) + 1;
+
     // Starts (or retargets) the fade of icon i toward its current metric/value.
-    // A fade caught mid-flight keeps going: still fading out — only the incoming
-    // glyph is replaced; already fading in — the direction reverses first so the
-    // half-shown glyph leaves the same way it came, with no hard cut.
-    private void BeginTrayFade(int i, byte fromValue, SD.Color fromColor, byte toValue, SD.Color toColor)
+    // A slot still fading out only swaps the incoming glyph (it has not shown
+    // yet). Once the incoming glyph starts fading in it always lands and rests
+    // a full second — changes arriving during fade-in or rest are recorded as
+    // the pending target (last one wins) and fade only after the rest ends, so
+    // every shown value is readable before it leaves.
+    private void BeginTrayFade(int i, byte fromValue, SD.Color fromColor, byte toValue, SD.Color toColor, float step)
     {
         if (_trayFades[i] is { } running)
         {
-            if (running.FadingIn)
+            if (running.FadingIn || running.RestFrames > 0)
             {
-                running.FromValue = running.ToValue;
-                running.FromColor = running.ToColor;
-                running.FadingIn = false;
+                running.HasPending = true;
+                running.PendingValue = toValue;
+                running.PendingColor = toColor;
+                running.PendingStep = step;
+                return;
             }
 
             running.ToValue = toValue;
             running.ToColor = toColor;
+            running.Step = step;
             return;
         }
 
@@ -395,14 +366,41 @@ public sealed partial class MainWindow : Window
             FromColor = fromColor,
             ToValue = toValue,
             ToColor = toColor,
+            Step = step,
         };
-        _trayFadeTimer ??= CreateTrayFadeTimer();
-        _trayFadeTimer.Start();
+        _fadeTimer ??= CreateFadeTimer();
+        _fadeTimer.Start();
     }
 
-    // Advances every active fade by one frame and stops itself once both icons
-    // are idle again (most of the time this timer is not running at all).
-    private DispatcherQueueTimer CreateTrayFadeTimer()
+    // Same retarget semantics as BeginTrayFade, for a window cell.
+    private void BeginCellFade(int m, string toText, SolidColorBrush toBrush, float step)
+    {
+        if (_cellFades[m] is { } running)
+        {
+            if (running.FadingIn || running.RestFrames > 0)
+            {
+                running.HasPending = true;
+                running.PendingText = toText;
+                running.PendingBrush = toBrush;
+                running.PendingStep = step;
+                return;
+            }
+
+            running.ToText = toText;
+            running.ToBrush = toBrush;
+            running.Step = step;
+            return;
+        }
+
+        _cellFades[m] = new CellFade { ToText = toText, ToBrush = toBrush, Step = step };
+        _fadeTimer ??= CreateFadeTimer();
+        _fadeTimer.Start();
+    }
+
+    // Advances every active fade (tray icons and window cells) by one frame and
+    // stops itself once everything is idle again (most of the time this timer is
+    // not running at all).
+    private DispatcherQueueTimer CreateFadeTimer()
     {
         var timer = _dispatcher.CreateTimer();
         timer.Interval = TimeSpan.FromMilliseconds(30);
@@ -421,9 +419,32 @@ public sealed partial class MainWindow : Window
                     continue;
                 }
 
+                if (fade.RestFrames > 0)
+                {
+                    if (--fade.RestFrames > 0)
+                    {
+                        active = true;
+                        continue;
+                    }
+
+                    if (!fade.HasPending || (fade.PendingValue == fade.ToValue && fade.PendingColor == fade.ToColor))
+                    {
+                        _trayFades[i] = null; // rested with nothing new to show
+                        continue;
+                    }
+
+                    fade.FromValue = fade.ToValue;
+                    fade.FromColor = fade.ToColor;
+                    fade.ToValue = fade.PendingValue;
+                    fade.ToColor = fade.PendingColor;
+                    fade.Step = fade.PendingStep;
+                    fade.HasPending = false;
+                    fade.FadingIn = false; // falls through into the fade-out below
+                }
+
                 if (!fade.FadingIn)
                 {
-                    fade.Opacity -= TrayFadeStep;
+                    fade.Opacity -= fade.Step;
                     if (fade.Opacity <= 0f)
                     {
                         fade.Opacity = 0f;
@@ -435,11 +456,13 @@ public sealed partial class MainWindow : Window
                 }
                 else
                 {
-                    fade.Opacity += TrayFadeStep;
+                    fade.Opacity += fade.Step;
                     if (fade.Opacity >= 1f)
                     {
-                        _trayFades[i] = null;
+                        fade.Opacity = 1f;
+                        fade.RestFrames = RestFrameCount; // linger so the value can be read
                         RenderTrayIcon(i, fade.ToValue, fade.ToColor, 1f);
+                        active = true;
                     }
                     else
                     {
@@ -449,27 +472,72 @@ public sealed partial class MainWindow : Window
                 }
             }
 
+            for (var m = 0; m < 6; m++)
+            {
+                if (_cellFades[m] is not { } fade)
+                {
+                    continue;
+                }
+
+                var cell = _cellBlocks[m];
+                if (fade.RestFrames > 0)
+                {
+                    if (--fade.RestFrames > 0)
+                    {
+                        active = true;
+                        continue;
+                    }
+
+                    if (!fade.HasPending || (fade.PendingText == fade.ToText && fade.PendingBrush == fade.ToBrush))
+                    {
+                        _cellFades[m] = null; // rested with nothing new to show
+                        continue;
+                    }
+
+                    fade.ToText = fade.PendingText;
+                    fade.ToBrush = fade.PendingBrush;
+                    fade.Step = fade.PendingStep;
+                    fade.HasPending = false;
+                    fade.FadingIn = false; // falls through into the fade-out below
+                }
+
+                if (!fade.FadingIn)
+                {
+                    fade.Opacity -= fade.Step;
+                    if (fade.Opacity <= 0f)
+                    {
+                        fade.Opacity = 0f;
+                        fade.FadingIn = true;
+                        SetCell(cell, fade.ToText, fade.ToBrush); // swap at the bottom of the dip
+                    }
+
+                    cell.Opacity = fade.Opacity;
+                    active = true;
+                }
+                else
+                {
+                    fade.Opacity += fade.Step;
+                    if (fade.Opacity >= 1f)
+                    {
+                        fade.Opacity = 1f;
+                        fade.RestFrames = RestFrameCount; // linger so the value can be read
+                        cell.Opacity = 1;
+                        active = true;
+                    }
+                    else
+                    {
+                        cell.Opacity = fade.Opacity;
+                        active = true;
+                    }
+                }
+            }
+
             if (!active)
             {
-                _trayFadeTimer!.Stop();
+                _fadeTimer!.Stop();
             }
         };
         return timer;
-    }
-
-    // Drift of a metric from its last-selection baseline: -1 = no current
-    // reading (never selected), 255 = a reading just (re)appeared, otherwise
-    // |current - baseline|.
-    private int TrayDelta(int device, int metric)
-    {
-        var cur = _trayValues[device * 3 + metric];
-        var shown = _trayShownValues[device * 3 + metric];
-        if (cur == Na)
-        {
-            return -1;
-        }
-
-        return shown == Na ? 255 : Math.Abs(cur - shown);
     }
 
     private void DestroyTrayIconImage(int i)
@@ -628,8 +696,7 @@ public sealed partial class MainWindow : Window
     {
         _exiting = true;
         _titleTimer?.Stop();
-        _trayTimer?.Stop();
-        _trayFadeTimer?.Stop();
+        _fadeTimer?.Stop();
         DisposeTrays();
         _client.Stop();
         _hardware.Dispose();
@@ -653,8 +720,7 @@ public sealed partial class MainWindow : Window
         // events, so mark the window as gone before any callback can touch it.
         _exiting = true;
         _titleTimer?.Stop();
-        _trayTimer?.Stop();
-        _trayFadeTimer?.Stop();
+        _fadeTimer?.Stop();
         DisposeTrays();
         _client.Stop();
         _hardware.Dispose();
@@ -669,14 +735,80 @@ public sealed partial class MainWindow : Window
                 return; // the window may already be closed — touching it throws
             }
 
-            SetCell(CpuLoad, Value(s.CpuLoad), LoadBrush);
-            SetCell(CpuTemp, Value(s.CpuTemp), TempBrush);
-            SetCell(CpuMem, Value(s.RamUsed), MemBrush);
-            SetCell(GpuLoad, Value(s.GpuLoad), LoadBrush);
-            SetCell(GpuTemp, Value(s.GpuTemp), TempBrush);
-            SetCell(GpuMem, Value(s.VramUsed), MemBrush);
+            var cur = s.ToPayload();
+            Span<int> deltas = stackalloc int[6];
+            for (var m = 0; m < 6; m++)
+            {
+                deltas[m] = SampleDelta(_lastSample[m], cur[m]);
+            }
 
-            s.ToPayload().CopyTo(_trayValues, 0);
+            // Window cells: each fades independently at its own delta's pace.
+            for (var m = 0; m < 6; m++)
+            {
+                if (deltas[m] == 0)
+                {
+                    continue;
+                }
+
+                BeginCellFade(m, Value(cur[m]), MetricBrushes[m % 3], FadeStep(deltas[m]));
+            }
+
+            // Tray: each icon follows the metric that moved the most this sample.
+            // Strictly-greater keeps the earlier index on ties → load > temp > mem.
+            for (var i = 0; i < 2; i++)
+            {
+                var fromMetric = _trayMetrics[i];
+
+                // Held: only the shown metric's value updates, the race stays shut.
+                if (_trayHoldTicks[i] > 0 && cur[i * 3 + fromMetric] != Na)
+                {
+                    _trayHoldTicks[i]--;
+                    var heldDelta = deltas[i * 3 + fromMetric];
+                    if (heldDelta == 0)
+                    {
+                        continue;
+                    }
+
+                    var value = cur[i * 3 + fromMetric];
+                    BeginTrayFade(
+                        i, _trayGlyphValues[i], TrayMetricColors[fromMetric],
+                        value, TrayMetricColors[fromMetric], FadeStep(heldDelta));
+                    _trayGlyphValues[i] = value;
+                    continue;
+                }
+
+                _trayHoldTicks[i] = 0; // expired, or voided — the held reading went dark
+
+                var bestMetric = 0;
+                var bestDelta = deltas[i * 3];
+                for (var m = 1; m < 3; m++)
+                {
+                    if (deltas[i * 3 + m] > bestDelta)
+                    {
+                        bestDelta = deltas[i * 3 + m];
+                        bestMetric = m;
+                    }
+                }
+
+                if (bestDelta == 0)
+                {
+                    continue; // nothing moved — the icon keeps its metric and value
+                }
+
+                _trayMetrics[i] = bestMetric;
+                if (bestMetric != fromMetric)
+                {
+                    _trayHoldTicks[i] = HoldTicks(bestDelta);
+                }
+
+                var target = cur[i * 3 + bestMetric];
+                BeginTrayFade(
+                    i, _trayGlyphValues[i], TrayMetricColors[fromMetric],
+                    target, TrayMetricColors[bestMetric], FadeStep(bestDelta));
+                _trayGlyphValues[i] = target;
+            }
+
+            cur.CopyTo(_lastSample, 0);
             if (_trays[0] is { } cpuTray)
             {
                 cpuTray.ToolTipText = $"CPU {Pct(s.CpuLoad)} {Deg(s.CpuTemp)} {Pct(s.RamUsed)}";
@@ -687,23 +819,11 @@ public sealed partial class MainWindow : Window
                 gpuTray.ToolTipText = $"GPU {Pct(s.GpuLoad)} {Deg(s.GpuTemp)} {Pct(s.VramUsed)}";
             }
 
-            // While the window is visible the icons run live and update together
-            // with the table above; hidden, they are redrawn only by the timer
-            // tick, and only when a metric has drifted far enough from the value
-            // stored at the last redraw (see CreateTrayTimer).
-            if (AppWindow.IsVisible)
-            {
-                for (var i = 0; i < 2; i++)
-                {
-                    RefreshTrayLive(i);
-                }
-            }
-
             // While connected the chart is fed from delivered frames (OnFrameSent);
             // local samples feed it only in the disconnected fallback.
             if (!_mirror)
             {
-                PushHistory(s.ToPayload());
+                PushHistory(cur);
                 if (_view != 0)
                 {
                     RedrawChart();

@@ -20,4 +20,16 @@ inline constexpr uint16_t Mem = 0xC01C;
 inline constexpr uint16_t MetricColors[3] = { Load, Temp, Mem };
 inline constexpr const char *MetricLabels[3] = { "LOAD", "TEMP", "MEM" };
 
+// Glyph color at brightness level 0..255 against the black background: scale the
+// 5-6-5 channels (the panel has no alpha, so a fade is a plain color ramp; if the
+// background ever stops being black this becomes a two-color lerp per channel).
+inline uint16_t Fade(uint16_t color, uint8_t level) {
+  const uint16_t r = (color >> 11) & 0x1F;
+  const uint16_t g = (color >> 5) & 0x3F;
+  const uint16_t b = color & 0x1F;
+  return (uint16_t)((((r * level) / 255) << 11) |
+                    (((g * level) / 255) << 5) |
+                    ((b * level) / 255));
+}
+
 }  // namespace Theme

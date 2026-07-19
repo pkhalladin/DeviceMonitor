@@ -19,6 +19,7 @@ void App::begin() {
 void App::tick() {
   if (_button.pollPressed()) {  // BOOT press advances the view
     _viewIndex = (_viewIndex + 1) % ViewCount;
+    _tableView.cancelAnimations();  // leaving (or re-entering) the table snaps
     _fullRedraw = true;
   }
 
@@ -30,12 +31,15 @@ void App::tick() {
 // Polls the BLE server into the model — the main-task side of the cross-task boundary,
 // so the history ring buffer is never touched concurrently with the BLE host task.
 void App::consumeBleState() {
+  bool newFrame = false;
+  MetricsFrame prev;
   const uint32_t seq = _ble.frameSeq();
   if (seq != _lastSeq) {
     _lastSeq = seq;
+    prev = _model.latest;
     _ble.copyLatestTo(_model.latest);
     _model.history.push(_model.latest);
-    _dirty = true;
+    newFrame = true;
   }
 
   const bool connected = _ble.isConnected();
@@ -47,7 +51,19 @@ void App::consumeBleState() {
       _ble.copyLatestTo(_model.latest);
       _model.history.reset();
     }
+    // A link flip snaps the table (losing the link is not a reading change).
+    _tableView.cancelAnimations();
     _dirty = true;
+  }
+
+  if (newFrame) {
+    if (_viewIndex == 0 && _model.connected && !_dirty && !_fullRedraw) {
+      // Active table: the fades cover the repaint — setting _dirty here would
+      // let drawContent snap over them (unchanged cells need no redraw at all).
+      _tableView.onFrame(prev, millis());
+    } else {
+      _dirty = true;  // charts redraw as before; an inactive table snaps later
+    }
   }
 }
 
@@ -59,5 +75,9 @@ void App::render() {
   } else if (_dirty) {  // fresh data (or link change): update the current view
     _dirty = false;
     _views[_viewIndex]->drawContent(_display.gfx());
+  }
+
+  if (_viewIndex == 0) {  // fast no-op while every cell is idle
+    _tableView.tickAnimations(_display.gfx(), millis());
   }
 }
